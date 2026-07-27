@@ -1,0 +1,52 @@
+# ardustep.hal -- wire LinuxCNC motion to the USB Arduino step generator.
+#
+# NOTE: ardustep.py and protocol.py must sit next to this file in the config
+# directory (copy or symlink them), or change the path in the loadusr line.
+# Adjust --device to wherever your Arduino enumerates (often /dev/ttyUSB0 for a
+# Nano/Uno clone, /dev/ttyACM0 for a genuine Uno).
+
+# ---- core motion --------------------------------------------------------------
+loadrt [KINS]KINEMATICS
+loadrt [EMCMOT]EMCMOT servo_period_nsec=[EMCMOT]SERVO_PERIOD num_joints=[KINS]JOINTS
+
+addf motion-command-handler servo-thread
+addf motion-controller      servo-thread
+
+# ---- estop logic: machine-on AND (not board-fault) ---------------------------
+loadrt not  names=not_fault
+loadrt and2 names=estop_and
+addf not_fault  servo-thread
+addf estop_and  servo-thread
+
+# ---- the USB step generator (userspace, non-realtime) ------------------------
+# -Wn waits until the HAL component named "ardustep" is ready before continuing.
+loadusr -Wn ardustep python3 ./ardustep.py --name ardustep \
+    --device /dev/ttyUSB0 --baud 1000000 --period 1 --spu 200,200,200
+
+# master enable: follow motion's enable line
+net machine-on  motion.motion-enabled  ardustep.enable
+
+# ---- per-joint position command / feedback -----------------------------------
+net j0-pos-cmd  joint.0.motor-pos-cmd   ardustep.joint.0.pos-cmd
+net j0-pos-fb   ardustep.joint.0.pos-fb joint.0.motor-pos-fb
+
+net j1-pos-cmd  joint.1.motor-pos-cmd   ardustep.joint.1.pos-cmd
+net j1-pos-fb   ardustep.joint.1.pos-fb joint.1.motor-pos-fb
+
+net j2-pos-cmd  joint.2.motor-pos-cmd   ardustep.joint.2.pos-cmd
+net j2-pos-fb   ardustep.joint.2.pos-fb joint.2.motor-pos-fb
+
+# ---- limit / home switches (comment out any axis without a switch) -----------
+net j0-lim  ardustep.limit.0  joint.0.neg-lim-sw-in joint.0.pos-lim-sw-in joint.0.home-sw-in
+net j1-lim  ardustep.limit.1  joint.1.neg-lim-sw-in joint.1.pos-lim-sw-in joint.1.home-sw-in
+net j2-lim  ardustep.limit.2  joint.2.neg-lim-sw-in joint.2.pos-lim-sw-in joint.2.home-sw-in
+
+# ---- estop chain: a watchdog fault from the board drops emc-enable -----------
+net board-fault    ardustep.fault            not_fault.in
+net estop-loop-a   iocontrol.0.user-enable-out  estop_and.in0
+net estop-loop-b   not_fault.out                estop_and.in1
+net estop-ok       estop_and.out                iocontrol.0.emc-enable-in
+
+# ---- tool change loopback (no real changer) ----------------------------------
+net tool-prep-loop    iocontrol.0.tool-prepare  iocontrol.0.tool-prepared
+net tool-change-loop  iocontrol.0.tool-change   iocontrol.0.tool-changed

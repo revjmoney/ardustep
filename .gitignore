@@ -1,0 +1,13 @@
+# PlatformIO
+firmware/ardustep/.pio/
+
+# Python
+__pycache__/
+*.pyc
+
+# Bench test output (local runs, not source)
+*.csv
+*.png
+
+# Claude Code local settings
+.claude/settings.local.json
