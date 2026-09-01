@@ -26,6 +26,14 @@ loadusr -Wn ardustep python3 ./ardustep.py --name ardustep \
 # master enable: follow motion's enable line
 net machine-on  motion.motion-enabled  ardustep.enable
 
+# A latched board fault cannot clear from an ordinary enable command. With the
+# machine disabled, pulse this pin true (for example with halcmd/setp or a UI
+# button), then release it before enabling again:
+#   halcmd setp ardustep.reset-fault true
+#   halcmd setp ardustep.reset-fault false
+# The optional ardustep.estop input sends the protocol's latched ESTOP flag.
+# Wire it to the appropriate active-high signal for your external safety chain.
+
 # ---- per-joint position command / feedback -----------------------------------
 net j0-pos-cmd  joint.0.motor-pos-cmd   ardustep.joint.0.pos-cmd
 net j0-pos-fb   ardustep.joint.0.pos-fb joint.0.motor-pos-fb

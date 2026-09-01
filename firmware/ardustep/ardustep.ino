@@ -1,45 +1,32 @@
-/*
- * ardustep.ino  --  USB step generator for LinuxCNC ("for science").
- *
- * Architecture (see README.md):
- *   LinuxCNC motion -> ardustep.py (USB serial) -> THIS firmware -> STEP/DIR.
- *
- * The host streams absolute position targets (in steps) once per cycle. We do
- * the actual pulse timing on-chip with a Timer1 DDS so the jittery USB link
- * only has to deliver setpoints, not microsecond-accurate steps. Each incoming
- * target is converted to a phase increment that sweeps the axis from its
- * current position to the target over one host interval (thin-buffer interp).
- *
- * We reply to every command with a feedback packet (actual step counts +
- * status), so LinuxCNC closes the position loop and enforces following error.
- */
+/* ardustep v2 -- experimental USB step generator for LinuxCNC. */
 #include <Arduino.h>
 #include "config.h"
 #include "protocol.h"
 #include "stepgen.h"
 
-/* Phase increment per step-of-delta for a one-interval sweep:
- *   inc = delta * 2^32 / (interval_s * ISR_HZ)
- * Precompute the constant factor K. */
-static const float K_INC =
-    4294967296.0f / (((float)CMD_INTERVAL_US * 1e-6f) * (float)ISR_HZ);
+#if (ISR_HZ * CMD_INTERVAL_US) % 1000000UL
+#error "CMD_INTERVAL_US must contain an integer number of ISR ticks"
+#endif
+#if TICKS_PER_CMD == 0
+#error "command interval must contain at least one ISR tick"
+#endif
 
-/* ---- incoming-packet framer -------------------------------------------- */
-static uint8_t  rxbuf[CMD_PACKET_LEN];
-static uint8_t  rxlen = 0;
+enum FrameType { FRAME_NONE, FRAME_COMMAND, FRAME_HELLO };
+static uint8_t rxbuf[CMD_PACKET_LEN];
+static uint8_t rxlen = 0;
+static uint8_t rx_expected = 0;
 
-/* ---- latched state ------------------------------------------------------ */
 static uint16_t underrun_count = 0;
 static uint32_t last_packet_ms = 0;
-static bool     faulted        = false;
-static bool     enabled        = false;
-static uint8_t  last_seq       = 0;
+static bool faulted = false;
+static bool enabled = false;          /* actual physical ENABLE state */
+static bool protocol_ready = false;
 
 static inline void set_enable_pin(bool on) {
 #if ENABLE_ACTIVE_HIGH
-    if (on) PORTB |=  (1 << ENABLE_PIN_BIT); else PORTB &= ~(1 << ENABLE_PIN_BIT);
+    if (on) PORTB |= (1 << ENABLE_PIN_BIT); else PORTB &= ~(1 << ENABLE_PIN_BIT);
 #else
-    if (on) PORTB &= ~(1 << ENABLE_PIN_BIT); else PORTB |=  (1 << ENABLE_PIN_BIT);
+    if (on) PORTB &= ~(1 << ENABLE_PIN_BIT); else PORTB |= (1 << ENABLE_PIN_BIT);
 #endif
 }
 
@@ -47,117 +34,179 @@ static inline void set_spindle_pin(bool on) {
     if (on) PORTB |= (1 << SPINDLE_PIN_BIT); else PORTB &= ~(1 << SPINDLE_PIN_BIT);
 }
 
+static void stop_outputs(void) {
+    stepgen_stop_all();
+    enabled = false;
+    set_enable_pin(false);
+    set_spindle_pin(false);
+}
+
 static uint8_t read_limits(void) {
-    /* active-low with pull-ups: pressed == pin low == bit set in result */
-    uint8_t pins = (uint8_t)(~PINC) & LIMIT_MASK;
-    return pins;   /* LIM_X|LIM_Y|LIM_Z already align to PC0..2 */
+    return (uint8_t)(~PINC) & LIMIT_MASK;
 }
 
 static void send_feedback(uint8_t seq, uint8_t limits) {
     FeedbackPacket fb;
-    fb.magic  = FB_MAGIC;
-    fb.seq    = seq;
+    bool busy = false;
+    fb.magic = FB_MAGIC;
+    fb.seq = seq;
     fb.status = 0;
-    if (stepgen_busy()) fb.status |= ST_RUNNING;
+    stepgen_snapshot(fb.pos_fb, &busy);
+    if (busy)           fb.status |= ST_RUNNING;
     if (enabled)        fb.status |= ST_ENABLED;
     if (faulted)        fb.status |= ST_FAULT;
     if (underrun_count) fb.status |= ST_UNDERRUN;
     fb.limits = limits;
-    for (uint8_t i = 0; i < NUM_AXES; i++) fb.pos_fb[i] = stepgen_position(i);
     fb.underruns = underrun_count;
     fb.crc = crc8((const uint8_t *)&fb, FB_PACKET_LEN - 1);
     Serial.write((const uint8_t *)&fb, FB_PACKET_LEN);
 }
 
-/* Act on a validated command packet. */
+static void send_info(uint8_t seq) {
+    InfoPacket info;
+    info.magic = INFO_MAGIC;
+    info.seq = seq;
+    info.proto_version = PROTO_VERSION;
+    info.fw_major = FW_VERSION_MAJOR;
+    info.fw_minor = FW_VERSION_MINOR;
+    info.axes = NUM_AXES;
+    info.isr_hz = ISR_HZ;
+    info.command_interval_us = CMD_INTERVAL_US;
+    info.max_step_rate = (uint16_t)MAX_STEP_RATE;
+    info.watchdog_ms = WATCHDOG_MS;
+    info.crc = crc8((const uint8_t *)&info, INFO_PACKET_LEN - 1);
+    Serial.write((const uint8_t *)&info, INFO_PACKET_LEN);
+}
+
+static uint32_t increment_for_delta(int64_t delta, bool *saturated) {
+    uint64_t magnitude = delta < 0 ? (uint64_t)(-delta) : (uint64_t)delta;
+    const uint32_t max_steps = MAX_STEP_RATE / (1000000UL / CMD_INTERVAL_US);
+    *saturated = magnitude > max_steps;
+    if (magnitude > max_steps) magnitude = max_steps;
+    return (uint32_t)((magnitude * 0x100000000ULL) / TICKS_PER_CMD);
+}
+
 static void handle_command(const CommandPacket *cmd) {
     last_packet_ms = millis();
-    last_seq = cmd->seq;
-
     bool estop = (cmd->flags & FLAG_ESTOP) != 0;
-    enabled    = (cmd->flags & FLAG_ENABLE) != 0;
+    bool request_enable = (cmd->flags & FLAG_ENABLE) != 0;
+    bool clear_fault = (cmd->flags & FLAG_CLEAR_FAULT) != 0;
 
-    if (estop || !enabled) {
-        stepgen_stop_all();
-        set_enable_pin(false);
-        set_spindle_pin(false);
-        if (estop) faulted = true;
+    if (!protocol_ready) {
+        stop_outputs();
+        faulted = true;
         return;
     }
-    faulted = false;
+    if (estop) {
+        stop_outputs();
+        faulted = true;
+        return;
+    }
+    if (clear_fault && !request_enable) {
+        stop_outputs();
+        faulted = false;
+        return;
+    }
+    if (!request_enable) {
+        stop_outputs();
+        return;
+    }
+    if (faulted) {
+        stop_outputs();
+        return;
+    }
+
+    enabled = true;
     set_enable_pin(true);
     set_spindle_pin((cmd->flags & FLAG_SPINDLE) != 0);
-
     for (uint8_t i = 0; i < NUM_AXES; i++) {
-        int32_t target = cmd->pos_cmd[i];
-        int32_t delta  = target - stepgen_position(i);
-        uint32_t mag   = (delta >= 0) ? (uint32_t)delta : (uint32_t)(-delta);
-
-        uint32_t inc;
-        float fi = (float)mag * K_INC;
-        if (fi >= 4294967295.0f) {           /* needs > 1 step/tick: clamp */
-            inc = 0xFFFFFFFFul;
-            if (underrun_count < 0xFFFF) underrun_count++;
-        } else {
-            inc = (uint32_t)fi;
-        }
-        bool un = false;
-        stepgen_set_target(i, target, inc, &un);
+        int32_t position = stepgen_position(i);
+        int64_t delta = (int64_t)cmd->pos_cmd[i] - (int64_t)position;
+        bool saturated = false;
+        uint32_t inc = increment_for_delta(delta, &saturated);
+        if (saturated && underrun_count != 0xFFFF) underrun_count++;
+        stepgen_set_target(i, cmd->pos_cmd[i], inc);
     }
 }
 
-/* Feed one received byte into the framer; returns true when a full, CRC-valid
- * CommandPacket has been assembled into rxbuf. */
-static bool framer_push(uint8_t b) {
-    if (rxlen == 0) {
-        if (b != CMD_MAGIC) return false;    /* hunt for magic */
-        rxbuf[rxlen++] = b;
-        return false;
+static FrameType resync_after_bad_frame(void) {
+    for (uint8_t i = 1; i < rxlen; i++) {
+        if (rxbuf[i] == CMD_MAGIC || rxbuf[i] == HELLO_MAGIC) {
+            uint8_t keep = rxlen - i;
+            memmove(rxbuf, rxbuf + i, keep);
+            rxlen = keep;
+            rx_expected = rxbuf[0] == CMD_MAGIC ? CMD_PACKET_LEN : HELLO_PACKET_LEN;
+            if (rxlen >= rx_expected) {
+                FrameType recovered = rxbuf[0] == CMD_MAGIC ? FRAME_COMMAND : FRAME_HELLO;
+                if (crc8(rxbuf, rx_expected - 1) == rxbuf[rx_expected - 1]) {
+                    rxlen = 0;
+                    rx_expected = 0;
+                    return recovered;
+                }
+                rxlen = 0;
+                rx_expected = 0;
+            }
+            return FRAME_NONE;
+        }
     }
-    rxbuf[rxlen++] = b;
-    if (rxlen < CMD_PACKET_LEN) return false;
+    rxlen = 0;
+    rx_expected = 0;
+    return FRAME_NONE;
+}
 
-    rxlen = 0;                               /* full frame captured */
-    if (crc8(rxbuf, CMD_PACKET_LEN - 1) != rxbuf[CMD_PACKET_LEN - 1]) {
-        return false;                        /* bad CRC -> drop, resync */
+static FrameType framer_push(uint8_t byte) {
+    if (rxlen == 0) {
+        if (byte == CMD_MAGIC) rx_expected = CMD_PACKET_LEN;
+        else if (byte == HELLO_MAGIC) rx_expected = HELLO_PACKET_LEN;
+        else return FRAME_NONE;
     }
-    return true;
+    rxbuf[rxlen++] = byte;
+    if (rxlen < rx_expected) return FRAME_NONE;
+
+    uint8_t complete_len = rx_expected;
+    FrameType type = rxbuf[0] == CMD_MAGIC ? FRAME_COMMAND : FRAME_HELLO;
+    if (crc8(rxbuf, complete_len - 1) != rxbuf[complete_len - 1]) {
+        return resync_after_bad_frame();
+    }
+    rxlen = 0;
+    rx_expected = 0;
+    return type;
 }
 
 void setup(void) {
-    /* control + spindle pins as outputs, de-asserted */
-    DDRB  |= (1 << ENABLE_PIN_BIT) | (1 << SPINDLE_PIN_BIT);
+    DDRB |= (1 << ENABLE_PIN_BIT) | (1 << SPINDLE_PIN_BIT);
     set_enable_pin(false);
     set_spindle_pin(false);
-
-    /* limit inputs with pull-ups */
-    DDRC  &= ~LIMIT_MASK;
-    PORTC |=  LIMIT_MASK;
-
+    DDRC &= ~LIMIT_MASK;
+    PORTC |= LIMIT_MASK;
     stepgen_init();
     Serial.begin(SERIAL_BAUD);
     last_packet_ms = millis();
 }
 
 void loop(void) {
-    /* Drain whatever the USB CDC has buffered, acting on each complete frame. */
     while (Serial.available()) {
-        if (framer_push((uint8_t)Serial.read())) {
+        FrameType frame = framer_push((uint8_t)Serial.read());
+        if (frame == FRAME_HELLO) {
+            HelloPacket hello;
+            memcpy(&hello, rxbuf, HELLO_PACKET_LEN);
+            protocol_ready = hello.proto_version == PROTO_VERSION;
+            if (!protocol_ready) {
+                stop_outputs();
+                faulted = true;
+            }
+            last_packet_ms = millis();
+            send_info(hello.seq);
+        } else if (frame == FRAME_COMMAND) {
             CommandPacket cmd;
             memcpy(&cmd, rxbuf, CMD_PACKET_LEN);
-            uint8_t limits = read_limits();
             handle_command(&cmd);
-            send_feedback(cmd.seq, limits);
+            send_feedback(cmd.seq, read_limits());
         }
     }
 
-    /* Watchdog: lost the host -> stop and fault. */
-    if ((uint32_t)(millis() - last_packet_ms) > WATCHDOG_MS) {
-        if (!faulted) {
-            stepgen_stop_all();
-            set_enable_pin(false);
-            set_spindle_pin(false);
-            faulted = true;
-        }
+    if ((uint32_t)(millis() - last_packet_ms) > WATCHDOG_MS && !faulted) {
+        stop_outputs();
+        faulted = true;
     }
 }

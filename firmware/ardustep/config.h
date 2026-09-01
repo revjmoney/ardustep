@@ -31,6 +31,15 @@
 #define CMD_INTERVAL_US 1000UL      /* expected host cycle; sets interp slope */
 #define WATCHDOG_MS     50          /* no valid packet for this long -> stop  */
 
+/* One tick high plus one complete tick low guarantees distinct STEP edges.
+ * Direction changes are performed by the ISR and get one tick of hold and
+ * setup time. At 30 kHz each tick is about 33.3 us. */
+#define STEP_LOW_TICKS  1
+#define DIR_SETUP_TICKS 1
+#define DIR_HOLD_TICKS  1
+#define MAX_STEP_RATE   (ISR_HZ / (1UL + STEP_LOW_TICKS))
+#define TICKS_PER_CMD   ((ISR_HZ * CMD_INTERVAL_US) / 1000000UL)
+
 /* ---- PORTD bit layout (do not move off PORTD without reworking the ISR) -- */
 #define STEP_MASK       0x1C        /* PD2|PD3|PD4                            */
 #define DIR_MASK        0xE0        /* PD5|PD6|PD7                            */

@@ -19,11 +19,9 @@
 
 void    stepgen_init(void);
 
-/* Atomically retarget one axis. `target` is absolute, in steps. `inc` is the
- * precomputed phase increment for this interval. `underrun` is set true if the
- * move was clamped to the 1-step-per-tick ceiling (the axis cannot keep up). */
-void    stepgen_set_target(uint8_t axis, int32_t target, uint32_t inc,
-                           bool *underrun);
+/* Atomically retarget one axis. Ordinary same-direction retargets preserve DDS
+ * phase. Reversals reset phase and are applied by the ISR with DIR timing. */
+void    stepgen_set_target(uint8_t axis, int32_t target, uint32_t inc);
 
 /* Stop everything immediately (zero all phase increments). */
 void    stepgen_stop_all(void);
@@ -33,5 +31,8 @@ int32_t stepgen_position(uint8_t axis);
 
 /* True if any axis still has steps remaining to its target. */
 bool    stepgen_busy(void);
+
+/* Coherent atomic snapshot for a feedback packet. */
+void    stepgen_snapshot(int32_t positions[NUM_AXES], bool *busy);
 
 #endif /* ARDUSTEP_STEPGEN_H */

@@ -18,17 +18,22 @@
 
 #include <stdint.h>
 
-#define PROTO_VERSION   1
+#define PROTO_VERSION   2
+#define FW_VERSION_MAJOR 2
+#define FW_VERSION_MINOR 0
 
 #define NUM_AXES        3
 
 #define CMD_MAGIC       0xA5    /* PC -> MCU */
 #define FB_MAGIC        0x5A    /* MCU -> PC */
+#define HELLO_MAGIC     0xC3    /* PC -> MCU startup compatibility query */
+#define INFO_MAGIC      0x3C    /* MCU -> PC startup compatibility reply */
 
 /* CommandPacket.flags bits */
 #define FLAG_ENABLE     0x01    /* drivers/motion enabled                  */
 #define FLAG_ESTOP      0x02    /* emergency stop asserted -> hard zero vel */
 #define FLAG_SPINDLE    0x04    /* spindle on/off (PWM duty = spindle field)*/
+#define FLAG_CLEAR_FAULT 0x08   /* clear latch only while disabled          */
 
 /* FeedbackPacket.status bits */
 #define ST_RUNNING      0x01    /* at least one axis is moving             */
@@ -62,8 +67,42 @@ typedef struct __attribute__((packed)) {
     uint8_t  crc;            /* CRC-8 over bytes [0 .. sizeof-2]            */
 } FeedbackPacket;
 
+/* Startup exchange. Firmware returns InfoPacket even when the requested
+ * version differs, so the host can report the exact incompatibility. */
+typedef struct __attribute__((packed)) {
+    uint8_t magic;           /* = HELLO_MAGIC */
+    uint8_t seq;             /* echoed in InfoPacket */
+    uint8_t proto_version;   /* host's required protocol version */
+    uint8_t crc;
+} HelloPacket;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  magic;          /* = INFO_MAGIC */
+    uint8_t  seq;
+    uint8_t  proto_version;
+    uint8_t  fw_major;
+    uint8_t  fw_minor;
+    uint8_t  axes;
+    uint32_t isr_hz;
+    uint16_t command_interval_us;
+    uint16_t max_step_rate;
+    uint16_t watchdog_ms;
+    uint8_t  crc;
+} InfoPacket;
+
 #define CMD_PACKET_LEN  18
 #define FB_PACKET_LEN   19
+#define HELLO_PACKET_LEN 4
+#define INFO_PACKET_LEN  17
+
+typedef char command_packet_size_must_match[
+    sizeof(CommandPacket) == CMD_PACKET_LEN ? 1 : -1];
+typedef char feedback_packet_size_must_match[
+    sizeof(FeedbackPacket) == FB_PACKET_LEN ? 1 : -1];
+typedef char hello_packet_size_must_match[
+    sizeof(HelloPacket) == HELLO_PACKET_LEN ? 1 : -1];
+typedef char info_packet_size_must_match[
+    sizeof(InfoPacket) == INFO_PACKET_LEN ? 1 : -1];
 
 /* CRC-8, polynomial 0x07 (CRC-8/SMBus), init 0x00. Table-free. */
 static inline uint8_t crc8(const uint8_t *data, uint8_t len) {
