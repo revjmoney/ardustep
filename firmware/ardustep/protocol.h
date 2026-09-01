@@ -37,7 +37,7 @@
 
 /* FeedbackPacket.status bits */
 #define ST_RUNNING      0x01    /* at least one axis is moving             */
-#define ST_ENABLED      0x02    /* echo of FLAG_ENABLE as latched by MCU   */
+#define ST_ENABLED      0x02    /* physical driver ENABLE output is active */
 #define ST_FAULT        0x04    /* watchdog tripped / estop latched        */
 #define ST_UNDERRUN     0x08    /* a commanded move exceeded step ceiling  */
 
