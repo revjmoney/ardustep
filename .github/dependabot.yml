@@ -1,0 +1,12 @@
+# Dependabot version updates: one grouped pull request per ecosystem each week.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
